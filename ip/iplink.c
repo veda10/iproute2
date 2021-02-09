@@ -379,6 +379,16 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 
 	while (NEXT_ARG_OK()) {
 		NEXT_ARG();
+		if (matches(*argv, "mirror") == 0){
+			struct ifla_vf_mirror ivmr = { 0 };
+
+			NEXT_ARG();
+			ivmr.vf = vf;
+			ivmr.src_type = ;
+
+			ivmr.src_id = *argv;
+			addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR, &ivmr, sizeof(ivmr));
+		}
 		if (matches(*argv, "mac") == 0) {
 			struct ifla_vf_mac ivm = { 0 };
 			int halen = nl_get_ll_addr_len(dev);
