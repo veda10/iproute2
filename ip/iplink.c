@@ -384,6 +384,7 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 
 			ivmr.vf = vf;
 			NEXT_ARG();
+			ivmr.src_id=-1U;
 
 			if (matches(*argv, "vf") == 0){
 				ivmr.src_type = PORT_MIRROR_SRC_VF;
@@ -394,9 +395,15 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 			else if(matches(*argv, "pf") == 0){
 				ivmr.src_type = PORT_MIRROR_SRC_PF;
 			}
+			else if(matches(*argv,"NONE") == 0){
+				ivmr.src_type = PORT_MIRROR_SRC_NONE;
+			}
 
-			NEXT_ARG();
-			ivmr.src_id = *argv;
+			if(NEXT_ARG_OK()){
+				NEXT_ARG();
+				if (get_unsigned(&ivmr.src_id, *argv, 0))
+					invarg("Invalid \"source\" value\n", *argv);
+			}
 
 			addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR, &ivmr, sizeof(ivmr));
 		} else if (matches(*argv, "mac") == 0) {

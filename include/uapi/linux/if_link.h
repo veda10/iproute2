@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
-#ifndef _LINUX_IF_LINK_H
-#define _LINUX_IF_LINK_H
+#ifndef _UAPI_LINUX_IF_LINK_H
+#define _UAPI_LINUX_IF_LINK_H
 
 #include <linux/types.h>
 #include <linux/netlink.h>
@@ -75,8 +75,9 @@ struct rtnl_link_stats {
  *
  * @rx_dropped: Number of packets received but not processed,
  *   e.g. due to lack of resources or unsupported protocol.
- *   For hardware interfaces this counter should not include packets
- *   dropped by the device which are counted separately in
+ *   For hardware interfaces this counter may include packets discarded
+ *   due to L2 address filtering but should not include packets dropped
+ *   by the device due to buffer exhaustion which are counted separately in
  *   @rx_missed_errors (since procfs folds those two counters together).
  *
  * @tx_dropped: Number of packets dropped on their way to transmission,
@@ -356,8 +357,10 @@ enum {
 };
 
 /* backwards compatibility for userspace */
+#ifndef __KERNEL__
 #define IFLA_RTA(r)  ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct ifinfomsg))))
 #define IFLA_PAYLOAD(n) NLMSG_PAYLOAD(n,sizeof(struct ifinfomsg))
+#endif
 
 enum {
 	IFLA_INET_UNSPEC,
@@ -586,6 +589,8 @@ enum {
 	IFLA_MACVLAN_MACADDR,
 	IFLA_MACVLAN_MACADDR_DATA,
 	IFLA_MACVLAN_MACADDR_COUNT,
+	IFLA_MACVLAN_BC_QUEUE_LEN,
+	IFLA_MACVLAN_BC_QUEUE_LEN_USED,
 	__IFLA_MACVLAN_MAX,
 };
 
@@ -899,6 +904,7 @@ enum {
 	IFLA_VF_IB_PORT_GUID,	/* VF Infiniband port GUID */
 	IFLA_VF_VLAN_LIST,	/* nested list of vlans, option for QinQ */
 	IFLA_VF_BROADCAST,	/* VF broadcast */
+	IFLA_VF_MIRROR,
 	__IFLA_VF_MAX,
 };
 
@@ -991,6 +997,19 @@ enum {
 struct ifla_vf_trust {
 	__u32 vf;
 	__u32 setting;
+};
+
+enum {
+	PORT_MIRROR_SRC_NONE,
+	PORT_MIRROR_SRC_PF,
+	PORT_MIRROR_SRC_VF,
+	PORT_MIRROR_SRC_VLAN,
+};
+
+struct ifla_vf_mirror {
+	__u32 vf;
+	__u32 src_type;
+	__u32 src_id;
 };
 
 /* VF ports management section
@@ -1243,4 +1262,4 @@ struct ifla_rmnet_flags {
 	__u32	mask;
 };
 
-#endif /* _LINUX_IF_LINK_H */
+#endif /* _UAPI_LINUX_IF_LINK_H */
