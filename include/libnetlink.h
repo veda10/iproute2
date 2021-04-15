@@ -51,6 +51,7 @@ void rtnl_close(struct rtnl_handle *rth);
 void rtnl_set_strict_dump(struct rtnl_handle *rth);
 
 typedef int (*req_filter_fn_t)(struct nlmsghdr *nlh, int reqlen);
+typedef int (*req_filter_attr_fn_t)(struct nlmsghdr *nlh, int reqlen, void *data, int data_size);
 
 int rtnl_addrdump_req(struct rtnl_handle *rth, int family,
 		      req_filter_fn_t filter_fn)

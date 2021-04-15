@@ -517,7 +517,6 @@ int rtnl_linkdump_req_filter(struct rtnl_handle *rth, int family,
 
 	return __rtnl_linkdump_req(rth, family);
 }
-
 int rtnl_linkdump_req_filter_fn(struct rtnl_handle *rth, int family,
 				req_filter_fn_t filter_fn)
 {
@@ -983,7 +982,7 @@ next:
 				int error = err->error;
 
 				if (l < sizeof(struct nlmsgerr)) {
-					fprintf(stderr, "ERROR truncated\n");
+					fprintf(stderr, "ERROR truncated, expecting %ld, received : %d\n", sizeof(struct nlmsgerr),l);
 					free(buf);
 					return -1;
 				}
@@ -1257,7 +1256,6 @@ int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data,
 {
 	int len = RTA_LENGTH(alen);
 	struct rtattr *rta;
-
 	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen) {
 		fprintf(stderr,
 			"addattr_l ERROR: message exceeded bound of %d\n",

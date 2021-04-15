@@ -45,6 +45,10 @@
 #define GSO_MAX_SEGS		65535
 #endif
 
+struct mirror_info {
+	struct mirror_info *next;
+	struct ifla_vf_mirror_info info;
+};
 
 static void usage(void) __attribute__((noreturn));
 static int iplink_have_newlink(void);
@@ -344,6 +348,642 @@ static void iplink_parse_vf_vlan_info(int vf, int *argcp, char ***argvp,
 	*argvp = argv;
 }
 
+static void add_ivmi(struct mirror_info **mi_head, struct ifla_vf_mirror_info *ivmi){
+
+	struct mirror_info *newmi = malloc(sizeof(struct mirror_info));
+	if(newmi != NULL){
+                memcpy(&newmi->info, ivmi, sizeof(struct ifla_vf_mirror_info));
+        }
+	newmi->next = *mi_head;
+	*mi_head = newmi;
+}
+
+static void del_ivmi(struct mirror_info **mi_head){
+	struct mirror_info *temp;
+
+	while(*mi_head!=NULL){
+		temp = *mi_head;
+		*mi_head = (*mi_head)->next;
+		free(temp);
+	}
+}
+
+static int vf_mirror_get(const char *name, struct ifla_vf_mirror_info *ivmi)
+{
+	struct iplink_req req = {
+		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
+		.n.nlmsg_flags = NLM_F_REQUEST,
+		.n.nlmsg_type = RTM_GETLINK,
+		.i.ifi_family = preferred_family,
+	};
+	struct nlmsghdr *answer;
+	struct ifinfomsg *ifi;
+        struct rtattr *tb[IFLA_MAX+1];
+        int len;
+	int err;
+
+	if (name) {
+		addattr_l(&req.n, sizeof(req),
+			  !check_ifname(name) ? IFLA_IFNAME : IFLA_ALT_IFNAME,
+			  name, strlen(name) + 1);
+	}
+	addattr_l(&req.n, sizeof(req), IFLA_VF_MIRRORINFO, ivmi, sizeof (struct ifla_vf_mirror_info));
+
+	err = rtnl_talk_suppress_rtnl_errmsg(&rth, &req.n, &answer);
+        if (err < 0) {
+		if (answer->nlmsg_type == NLMSG_ERROR) {
+			struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(answer);
+
+			if (answer->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) {
+				fprintf(stderr, "ERROR truncated\n");
+				return -1;
+			} else {
+				return err->error;
+			}
+		}
+	}
+
+	ifi = NLMSG_DATA(answer);
+        len = answer->nlmsg_len;
+        
+	len -= NLMSG_LENGTH(sizeof(*ifi));
+        if (len < 0)
+                return -1;
+
+        parse_rtattr_flags(tb, IFLA_MAX, IFLA_RTA(ifi), len, NLA_F_NESTED);
+
+	if (tb[IFLA_VF_MIRRORINFO]) {
+                memcpy(ivmi , RTA_DATA(tb[IFLA_VF_MIRRORINFO]),sizeof(struct ifla_vf_mirror_info));
+        }
+
+	free(answer);
+	return 0;
+}
+static int print_mirrorinfo(struct mirror_info *minfo_head, void *arg)
+{
+	struct ifla_vf_mirror_info *ivmi;
+	char filter_src[20];
+	char direction[3][10] = {"in","out","in|out"};
+	print_string(PRINT_ANY, "Mirroring", "Mirroring %s\n", minfo_head ? "On": "Off");
+	if (!minfo_head)
+		return 0;
+#if 0
+	if (minfo_head->info.action == IFLA_VF_MIRROR_VF)
+		strncpy(filter_src, "VF: ", sizeof (filter_src));
+	else if (minfo_head->info.action == IFLA_VF_MIRROR_VLAN)
+		strncpy(filter_src, "Vlan(s): ", sizeof (filter_src));
+	else if (minfo_head->info.action == IFLA_VF_MIRROR_PF)
+		strncpy(filter_src, "PF:  ", sizeof (filter_src));
+#endif
+	print_string(PRINT_ANY, " ", "Filter :","");
+	do {
+		ivmi = &minfo_head->info;
+		if (minfo_head->info.action == IFLA_VF_MIRROR_VF) {
+			print_int(PRINT_ANY,"vf", "vf %d",ivmi->vf_to_vf.src_vf);
+			if (ivmi->vf_to_vf.dir_mask <=3 )
+				print_string(PRINT_ANY,"dir ", "(%s) ", direction[ivmi->vf_to_vf.dir_mask-1]);
+		}
+		else if (minfo_head->info.action == IFLA_VF_MIRROR_VLAN) {
+			print_int(PRINT_ANY,"Vlan", "vlan %d ",ivmi->vlan_mirror.vlan);
+		}
+		else if (minfo_head->info.action == IFLA_VF_MIRROR_PF) {
+			if (ivmi->pf_to_vf.dir_mask <=3 )
+				print_string(PRINT_ANY,"pf", "pf dir (%s)", direction[ivmi->pf_to_vf.dir_mask-1]);
+		}
+		minfo_head = minfo_head->next;
+	}while (minfo_head != NULL);
+	print_string(PRINT_ANY,"newline", "\n", "");
+
+	return 0;
+
+}
+
+static int get_existing_mirror(const char *dev, struct ifla_vf_mirror_info *ivmi, struct mirror_info **mi_head){
+	int i;
+	int err=0;
+	for (i=0; 1; i++) {
+        	ivmi->ele_index = i;
+                err = vf_mirror_get(dev, ivmi);
+                if (err == -EAGAIN) { // ip_link_list
+                        del_ivmi(mi_head);
+                        mi_head = NULL;
+                        i = -1;
+                        printf("vf_mirror_get corrupted\n");
+                        continue;
+                }
+                else if (err == -ENODATA)
+                {
+                                err = 0;
+                                break;
+                }
+                else if (err == 0){
+                                add_ivmi(mi_head, ivmi);
+                }
+                else {
+                                printf("Unhandled error :%d\n", err);
+                                break;
+                }
+
+        }
+return err;	
+}
+
+static void get_dir(char ***argvp,int *dir_mask, int *argcp){
+	int argc = *argcp;
+	char **argv = *argvp;
+
+	if (NEXT_ARG_OK()) {
+		NEXT_ARG();
+                if (matches(*argv, "dir") == 0) {               
+			NEXT_ARG();		
+			if (matches(*argv,"in")==0)
+                		*dir_mask= PORT_MIRRORING_INGRESS;
+        		else if (matches(*argv,"out")==0)
+                		*dir_mask= PORT_MIRRORING_EGRESS;
+        		else if (matches(*argv,"all")==0)
+                		*dir_mask= PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS;
+        		else
+                		invarg("Invalid \"direction\" value\n", *argv);
+		} else {                                     
+		     	invarg("Invalid \"argument\" value\n", *argv);                
+		}
+     	}
+	*argcp = argc;
+        *argvp = argv;
+}
+
+static void dump_args(int type, void *data)
+{
+	if (type == IFLA_VF_MIRROR_VF)
+	{
+		struct ifla_vf_mirror_vf *p = (struct ifla_vf_mirror_vf *)data;
+		printf("SENDING : VF dst_vf: %d src_vf : %d dir_mask : %d\n", p->dst_vf, p->src_vf, p->dir_mask);
+	}
+	else if (type == IFLA_VF_MIRROR_PF)
+	{
+		struct ifla_vf_mirror_pf *p = (struct ifla_vf_mirror_pf *)data;
+		printf("SENDING : PF dst_vf: %d dir_mask : %d\n", p->dst_vf, p->dir_mask);
+	}
+	else if (type == IFLA_VF_MIRROR_VLAN)
+	{
+		struct ifla_vf_mirror_vlan *p = (struct ifla_vf_mirror_vlan *)data;
+		printf("SENDING : VLAN dst_vf: %d vlan : %d\n", p->dst_vf, p->vlan);
+	}
+	else if (type == IFLA_VF_MIRROR_CLEAR)
+	{
+		struct ifla_vf_mirror_clear *p = (struct ifla_vf_mirror_clear *)data;
+		printf("SENDING : CLEAR dst_vf: %d \n", p->dst_vf);
+	}
+	else
+	{
+		printf("SENDING : KIll the caller\n");
+	}
+}
+
+
+static int iplink_parse_vf_mirror(int vf , int *argcp, char ***argvp, struct iplink_req *req, const char *dev){
+
+	int argc = *argcp;
+ 	char **argv = *argvp, *src_list;
+ 	int i=0;
+	int dir_mask = PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS;
+	int attr_count = 0;
+
+	if(matches(*argv,"add") == 0){
+		struct mirror_info *mi=NULL, *temp;
+        	struct ifla_vf_mirror_info ivmi;
+        	ivmi.dst_vf = vf;
+        	get_existing_mirror(dev, &ivmi,&mi);
+
+		NEXT_ARG();
+
+		if (matches(*argv, "vf") == 0){
+
+			struct ifla_vf_mirror_vf ivmv = {0};
+	        	ivmv.dst_vf= vf;
+	        	NEXT_ARG();
+			src_list = *argv;
+
+			int *items, nb_items = 0, id;
+
+			nb_items = get_int_args(src_list, &items);
+			if (nb_items <= 0) {
+				printf("Invalid args");
+				return -1;
+			}
+
+			get_dir(&argv,&dir_mask,&argc);
+
+			/*if (NEXT_ARG_OK()) {
+				NEXT_ARG();
+				if (matches(*argv, "dir") == 0) {
+					NEXT_ARG();
+					dir_mask= get_dir(&argv);
+				} else {
+					invarg("Invalid \"argument\" value\n", *argv);
+				}
+			}*/
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_VF){
+				printf("another type of rule is already set. Please clear it\n");
+				return -1;
+			}
+
+			temp=mi;
+
+			while (temp != NULL)
+			{
+				if (temp->info.action == IFLA_VF_MIRROR_VF) {
+					i = nb_items;
+					ivmv.src_vf = temp->info.vf_to_vf.src_vf;
+					ivmv.dir_mask = temp->info.vf_to_vf.dir_mask;
+					while (i) {
+						id = items[i-1];
+						if (temp->info.vf_to_vf.src_vf == id) {
+							ivmv.dir_mask |= dir_mask;
+							items[i-1] = -1;	
+							break;
+						}
+					--i;
+					}
+					dump_args(IFLA_VF_MIRROR_VF,&ivmv);
+					addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VF, &ivmv, sizeof(ivmv));
+				}
+				temp= temp->next;
+			}
+			i = nb_items;
+			while (i) {
+				if (items[i-1] >= 0)
+				{
+					ivmv.src_vf = items[i-1];
+					ivmv.dir_mask = dir_mask;
+					dump_args(IFLA_VF_MIRROR_VF,&ivmv);
+					addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VF, &ivmv, sizeof(ivmv));
+				}
+				i--;
+			}
+		}
+		else if(matches(*argv, "pf") == 0){
+	    		struct ifla_vf_mirror_pf ivmp = {0};
+	    		ivmp.dst_vf=vf;
+
+			get_dir(&argv,&dir_mask,&argc);
+
+	    		/*if (NEXT_ARG_OK()) {
+				NEXT_ARG();
+				if (matches(*argv, "dir") == 0) {
+					NEXT_ARG();
+					//dir_mask= get_dir(&argv);
+				} else {
+					invarg("Invalid \"argument\" value\n", *argv);
+				}
+			}*/
+
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_PF ){
+                        	printf("another type of rule is already set. Please clear it\n");
+				return -1;
+                        }
+
+			if(mi!=NULL && mi->info.pf_to_vf.dst_vf == vf && mi->info.action==IFLA_VF_MIRROR_PF){
+				ivmp.dir_mask = mi->info.pf_to_vf.dir_mask | dir_mask;
+
+			}
+			else{
+				ivmp.dir_mask = dir_mask;
+			}
+
+			dump_args(IFLA_VF_MIRROR_PF,&ivmp);
+	        	addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_PF, &ivmp, sizeof(ivmp));
+	    	}
+		else if(matches(*argv, "vlan") == 0){
+	    		struct ifla_vf_mirror_vlan ivml = {0};
+	    		ivml.dst_vf=vf;
+
+	    		NEXT_ARG();
+			src_list = *argv;
+
+			int *items, nb_items = 0, id;
+
+	                nb_items = get_int_args(src_list, &items);
+                	if (nb_items <= 0) {
+                        	printf("Invalid args");
+                        	return -1;
+                	}
+
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_VLAN){
+                                printf("another type of rule is already set. Please clear it\n");
+				return -1;
+                        }
+
+			temp=mi;
+                	while (temp != NULL)
+                	{
+                        	i = nb_items;
+				ivml.vlan = temp->info.vlan_mirror.vlan;
+				while (i) {
+					id = items[i-1];
+					if (temp->info.action == IFLA_VF_MIRROR_VLAN && temp->info.vlan_mirror.vlan == id) {
+						items[i-1] = -1;
+						break;
+					}
+					--i;
+				}
+				dump_args(IFLA_VF_MIRROR_VLAN,&ivml);
+				addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+				temp= temp->next;
+			}
+			i = nb_items;
+			while (i) {
+				if (items[i-1] >= 0)
+				{
+					ivml.vlan = items[i-1];
+					dump_args(IFLA_VF_MIRROR_VLAN,&ivml);
+					addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+				}
+				i--;
+			}
+	    	}
+
+	}
+
+	else if(matches(*argv,"del") == 0){
+		struct mirror_info *mi=NULL, *temp;
+        	struct ifla_vf_mirror_info ivmi;
+        	ivmi.dst_vf = vf;
+        	get_existing_mirror(dev, &ivmi,&mi);
+
+		NEXT_ARG();
+
+                if (matches(*argv, "vf") == 0){
+
+                	struct ifla_vf_mirror_vf ivmv = {0};
+			int *items, nb_items = 0, id;
+                	ivmv.dst_vf= vf;
+                	NEXT_ARG();
+                	src_list = *argv;
+			nb_items = get_int_args(src_list, &items);
+			if (nb_items <= 0) {
+				printf("Invalid args");
+				return -1;
+			}
+
+			get_dir(&argv,&dir_mask,&argc);
+
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_VF){
+                                printf("another type of rule is set.\n");
+                                return -1;
+                        }
+
+                        temp=mi;
+                        while (temp != NULL)
+                        {
+                                i = nb_items;
+                                while (i) {
+                                        id = items[i-1];
+                                        if (temp->info.action == IFLA_VF_MIRROR_VF && temp->info.vf_to_vf.src_vf == id) {
+                                                temp->info.vf_to_vf.dir_mask &= (~dir_mask);
+                                                items[i-1] = -1;
+                                                break;
+                                        }
+                                        --i;
+                                }
+                                temp= temp->next;
+                        }
+			//loop for items
+			
+			for(i=0;i<nb_items;i++){
+				if(items[i]!=-1){
+					printf("vf %d is not mirrored\n",items[i]);
+				}
+			}
+
+
+                        temp = mi;
+                        while (temp != NULL) {
+                                if (temp->info.vf_to_vf.dir_mask > 0)
+                                {
+                                        ivmv.src_vf = temp->info.vf_to_vf.src_vf;
+                                        ivmv.dir_mask = temp->info.vf_to_vf.dir_mask;
+					attr_count++;
+					dump_args(IFLA_VF_MIRROR_VF,&ivmv);
+                                        addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VF, &ivmv, sizeof(ivmv));
+                                }
+                                temp = temp->next;
+                        }
+			if (attr_count == 0)
+			{
+				struct ifla_vf_mirror_clear ivmc = {.dst_vf = vf};
+				dump_args(IFLA_VF_MIRROR_CLEAR,&ivmc);
+                                addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_CLEAR, &ivmc, sizeof(ivmc));
+			}
+
+         	}
+
+		else if(matches(*argv, "pf") == 0){
+                	struct ifla_vf_mirror_pf ivmp = {0};
+			get_dir(&argv,&dir_mask,&argc);
+       
+                	/*if (NEXT_ARG_OK()) {
+                                NEXT_ARG();
+                                if (matches(*argv, "dir") == 0) {
+                                        NEXT_ARG();
+                                         //dir_mask= get_dir(&argv);
+                                } else {
+                                        invarg("Invalid \"argument\" value\n", *argv);
+                                }
+                        }*/
+
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_PF ){
+                                printf("another type of rule is set.\n");
+                                return -1;
+                        }
+			if(mi!=NULL && mi->info.pf_to_vf.dst_vf == vf && mi->info.action==IFLA_VF_MIRROR_PF){
+				ivmp.dst_vf=vf;
+                        	mi->info.pf_to_vf.dir_mask &= (~dir_mask);
+                        	ivmp.dir_mask = mi->info.pf_to_vf.dir_mask;
+                	}
+                	else{
+				ivmp.dst_vf=-1;
+                        	ivmp.dir_mask = dir_mask;
+                	}
+
+			dump_args(IFLA_VF_MIRROR_PF,&ivmp);
+                	addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_PF, &ivmp, sizeof(ivmp));
+            	}
+
+		else if(matches(*argv, "vlan") == 0){
+                	struct ifla_vf_mirror_vlan ivml = {0};
+                	ivml.dst_vf=vf;
+
+                	NEXT_ARG();
+                	src_list = *argv;
+
+                	int *items, nb_items = 0, id;
+
+                	nb_items = get_int_args(src_list, &items);
+                	if (nb_items <= 0) {
+                        	printf("Invalid args");
+                        	return -1;
+                	}
+
+			if(mi!=NULL && mi->info.action!=IFLA_VF_MIRROR_VLAN){
+                                printf("another type of rule is set.\n");
+                                return -1;
+                        }
+
+                	temp=mi;
+                	while (temp != NULL)
+                	{
+                        	i = nb_items;
+                        	while (i) {
+                                	id = items[i-1];
+                                	if (temp->info.action == IFLA_VF_MIRROR_VLAN && temp->info.vlan_mirror.vlan == id) {
+                                        	items[i-1] = -1;
+						temp->info.vlan_mirror.vlan = 0;
+                                        	break;
+                                	}
+                                	--i;
+                        	}
+                        	temp= temp->next;
+                	}
+
+			for(i=0;i<nb_items;i++){
+                                if(items[i]!=-1){
+                                        printf("vlan %d is not mirrored\n",items[i]);
+                                }
+                        }
+
+			temp = mi;
+                        while (temp != NULL) {
+                                if (temp->info.vlan_mirror.vlan > 0)
+                                {
+                                        ivml.vlan = temp->info.vlan_mirror.vlan;
+					attr_count++;
+					dump_args(IFLA_VF_MIRROR_VLAN,&ivml);
+                                        addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+                                }
+                                temp = temp->next;
+                        }
+
+			if (attr_count == 0)
+                        {
+                                struct ifla_vf_mirror_clear ivmc = {.dst_vf = vf};
+                                dump_args(IFLA_VF_MIRROR_CLEAR,&ivmc);
+                                addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_CLEAR, &ivmc, sizeof(ivmc));
+                        }
+		}
+
+	}
+
+	else if(matches(*argv,"set") == 0){
+                NEXT_ARG();
+
+		if (matches(*argv, "vf") == 0){
+                	struct ifla_vf_mirror_vf ivmv = {0};
+                	ivmv.dst_vf= vf;
+                	NEXT_ARG();
+                	src_list = *argv;
+			int *items, nb_items = 0;
+	
+        	        nb_items = get_int_args(src_list, &items);
+                	if (nb_items <= 0) {
+				printf("Invalid args");
+                        	return -1;
+                	}
+
+			get_dir(&argv,&dir_mask,&argc);
+
+                	/*if (NEXT_ARG_OK()) {
+                                NEXT_ARG();
+                                if (matches(*argv, "dir") == 0) {
+                                        NEXT_ARG();
+                                        //ivmv.dir_mask= get_dir(&argv);
+                                } else
+                                        invarg("Invalid \"argument\" value\n", *argv);
+                	}*/
+			i=nb_items;
+			while (i) {
+                                if (items[i-1] >= 0)
+                                {
+                                        ivmv.src_vf = items[i-1];
+                                        dump_args(IFLA_VF_MIRROR_VF,&ivmv);
+                                        addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VF, &ivmv, sizeof(ivmv));
+                                }
+                                i--;
+                        }
+		}
+
+		else if(matches(*argv, "pf") == 0){
+                	struct ifla_vf_mirror_pf ivmp = {0};
+                	ivmp.dst_vf=vf;
+
+			get_dir(&argv,&dir_mask,&argc);
+
+                	/*if (NEXT_ARG_OK()) {
+                                NEXT_ARG();
+                                if (matches(*argv, "dir") == 0) {
+                                        NEXT_ARG();
+                                        //ivmp.dir_mask= get_dir(&argv);
+                                } else 
+                                        invarg("Invalid \"argument\" value\n", *argv);
+                        }*/
+			dump_args(IFLA_VF_MIRROR_PF,&ivmp);
+                	addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_PF, &ivmp, sizeof(ivmp));
+            	}
+
+		else if(matches(*argv, "vlan") == 0){
+                	struct ifla_vf_mirror_vlan ivml = {0};
+                	ivml.dst_vf=vf;
+
+                	NEXT_ARG();
+                	src_list = *argv;
+
+			int *items, nb_items = 0;
+
+                        nb_items = get_int_args(src_list, &items);
+                        if (nb_items <= 0) {
+                                printf("Invalid args");
+                                return -1;
+                        }
+			i=nb_items;
+
+			while (i) {
+				ivml.vlan = items[i-1];
+				dump_args(IFLA_VF_MIRROR_VLAN,&ivml);
+				addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+                                i--;
+                        }
+           	}
+
+	}
+
+	else if(matches(*argv,"clear") == 0){
+		struct ifla_vf_mirror_clear ivmc ={0};
+		ivmc.dst_vf = vf;
+
+		dump_args(IFLA_VF_MIRROR_CLEAR,&ivmc);
+		addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_CLEAR, &ivmc, sizeof(ivmc));
+
+	}
+	else if (matches(*argv, "show") == 0) {
+		struct ifla_vf_mirror_info ivmi;
+		struct mirror_info *mi=NULL;
+		ivmi.vf_to_vf.dst_vf = vf;
+		int err = 0;
+		err = get_existing_mirror(dev, &ivmi,&mi);
+
+		if (!err)
+			print_mirrorinfo(mi,stdout);
+
+		del_ivmi(&mi);
+	}
+
+	*argcp = argc;
+	*argvp = argv;
+return 0;
+
+}
+
+
 static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 			   struct iplink_req *req, const char *dev)
 {
@@ -380,32 +1020,16 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 	while (NEXT_ARG_OK()) {
 		NEXT_ARG();
 		if (matches(*argv, "mirror") == 0){
-			struct ifla_vf_mirror ivmr = { 0 };
+			struct rtattr *vf_mirror;
 
-			ivmr.vf = vf;
+			vf_mirror = addattr_nest(&req->n, sizeof(*req),
+					      IFLA_VF_MIRROR);
 			NEXT_ARG();
-			ivmr.src_id=-1U;
+			if (iplink_parse_vf_mirror(vf, &argc, &argv,req, dev) < 0)
+				return -1;
 
-			if (matches(*argv, "vf") == 0){
-				ivmr.src_type = PORT_MIRROR_SRC_VF;
-			}
-			else if(matches(*argv, "vlan") == 0){
-				ivmr.src_type = PORT_MIRROR_SRC_VLAN;
-			}
-			else if(matches(*argv, "pf") == 0){
-				ivmr.src_type = PORT_MIRROR_SRC_PF;
-			}
-			else if(matches(*argv,"NONE") == 0){
-				ivmr.src_type = PORT_MIRROR_SRC_NONE;
-			}
+			addattr_nest_end(&req->n, vf_mirror);
 
-			if(NEXT_ARG_OK()){
-				NEXT_ARG();
-				if (get_unsigned(&ivmr.src_id, *argv, 0))
-					invarg("Invalid \"source\" value\n", *argv);
-			}
-
-			addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR, &ivmr, sizeof(ivmr));
 		} else if (matches(*argv, "mac") == 0) {
 			struct ifla_vf_mac ivm = { 0 };
 			int halen = nl_get_ll_addr_len(dev);
