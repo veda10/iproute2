@@ -341,7 +341,6 @@ enum {
 	IFLA_ALT_IFNAME, /* Alternative ifname */
 	IFLA_PERM_ADDRESS,
 	IFLA_PROTO_DOWN_REASON,
-	IFLA_VF_MIRRORINFO,
 	__IFLA_MAX
 };
 
