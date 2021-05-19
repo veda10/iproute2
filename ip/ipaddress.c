@@ -371,7 +371,7 @@ static void print_vf_mirror_info(struct rtattr *vf_attr)
 				pf_mirror = RTA_DATA(i);
 				if (pf_mirror->dir_mask > 0 && pf_mirror->dir_mask <= 3)
 				{
-					print_string(PRINT_ANY, "pf", " pf-%s",
+					print_string(PRINT_ANY, "pf", " pf<%s>",
 							dir_string[pf_mirror->dir_mask - 1]);
 					nb_items++;
 				}
@@ -380,14 +380,14 @@ static void print_vf_mirror_info(struct rtattr *vf_attr)
 				vf_mirror = RTA_DATA(i);
 				if (vf_mirror->dir_mask > 0 && vf_mirror->dir_mask <= 3)
 				{
-					sprintf(b2, " vf-%s-%d", dir_string[vf_mirror->dir_mask -1], vf_mirror->src_vf);
+					sprintf(b2, " vf<%s,%d>", dir_string[vf_mirror->dir_mask -1], vf_mirror->src_vf);
 					print_string(PRINT_ANY, "vf", "%s", b2);
 					nb_items++;
 				}
 				break;
 			case IFLA_VF_MIRROR_VLAN:
 				vlan_mirror = RTA_DATA(i);
-				print_int(PRINT_ANY, "vf", " vlan-%d", vlan_mirror->vlan);
+				print_int(PRINT_ANY, "vf", " vlan<%d>", vlan_mirror->vlan);
 				nb_items++;
 				break;
 			default:
