@@ -45,6 +45,20 @@
 #define GSO_MAX_SEGS		65535
 #endif
 
+struct vf_mirror_info {
+	enum mirror_type action;
+	union {
+		__u32 dst_vf;
+		struct ifla_vf_mirror_vf vf_to_vf;
+		struct ifla_vf_mirror_pf pf_to_vf;
+		struct ifla_vf_mirror_vlan vlan_mirror;
+	} data;
+};
+
+struct vf_mirror_node {
+	struct vf_mirror_node *next;
+	struct vf_mirror_info info;
+};
 
 static void usage(void) __attribute__((noreturn));
 static int iplink_have_newlink(void);
@@ -97,7 +111,17 @@ void iplink_usage(void)
 		"			 [ state { auto | enable | disable} ]\n"
 		"			 [ trust { on | off} ]\n"
 		"			 [ node_guid EUI64 ]\n"
-		"			 [ port_guid EUI64 ] ]\n"
+		"			 [ port_guid EUI64 ]\n"
+		"			 [ mirror [ add   [ vf SRC [ dir { in | out | all } ] ]]\n"
+		"					[ pf  [ dir { in | out | all } ] ]\n"
+		"					[ vlan VLANID ]\n"
+		"				[ del   [ vf SRC [ dir { in | out | all } ] ]]\n"
+		"					  [ pf  [ dir { in | out | all } ] ]\n"
+		"					  [ vlan VLANID ]\n"
+		"				[ set   [ vf SRC [ dir { in | out | all } ] ]]\n"
+		"					  [ pf  [ dir { in | out | all } ] ]\n"
+		"					  [ vlan VLANID ]\n"
+		"				[ clear ] ] ]\n"
 		"		[ { xdp | xdpgeneric | xdpdrv | xdpoffload } { off |\n"
 		"			  object FILE [ section NAME ] [ verbose ] |\n"
 		"			  pinned FILE } ]\n"
@@ -344,6 +368,507 @@ static void iplink_parse_vf_vlan_info(int vf, int *argcp, char ***argvp,
 	*argvp = argv;
 }
 
+static int add_mirror_info(struct vf_mirror_node **mi_head,
+			   int type, void *data)
+{
+	int length[] = {sizeof(struct ifla_vf_mirror_clear),
+			sizeof(struct ifla_vf_mirror_pf),
+			sizeof(struct ifla_vf_mirror_vf),
+			sizeof(struct ifla_vf_mirror_vlan)};
+
+	struct vf_mirror_node *newmi;
+
+	if (type >= IFLA_VF_MIRROR_MAX)
+		return -1;
+
+	newmi = malloc(sizeof(struct vf_mirror_node));
+	if (newmi != NULL) {
+		newmi->info.action = type;
+		memcpy(&newmi->info.data, data, length[type]);
+	} else {
+		return -1;
+	}
+	newmi->next = *mi_head;
+	*mi_head = newmi;
+
+	return 0;
+}
+
+static void del_mirror_list(struct vf_mirror_node **mi_head)
+{
+	struct vf_mirror_node *temp;
+
+	while (*mi_head != NULL) {
+		temp = *mi_head;
+		*mi_head = (*mi_head)->next;
+		free(temp);
+	}
+}
+
+static int parse_vf_mirror(struct nlmsghdr *answer, int vfid,
+			   struct vf_mirror_node **head)
+{
+	struct rtattr *i;
+	struct ifinfomsg *ifi = NLMSG_DATA(answer);
+	int rem, len = answer->nlmsg_len;
+	int dst_vf, type;
+	struct rtattr *rta = IFLA_RTA(ifi), *vf_attr;
+
+	if (answer->nlmsg_type != RTM_NEWLINK &&
+	    answer->nlmsg_type != RTM_DELLINK)
+		return 0;
+
+	len -= NLMSG_LENGTH(sizeof(*ifi));
+	if (len < 0)
+		return -1;
+
+	rta = parse_rtattr_one(IFLA_VFINFO_LIST, rta, len);
+	len = RTA_PAYLOAD(rta);
+	for (i = RTA_DATA(rta); RTA_OK(i, len); i = RTA_NEXT(i, len)) {
+		rta = parse_rtattr_one_nested(IFLA_VF_MIRROR, i);
+		rem = RTA_PAYLOAD(rta);
+		for (vf_attr = RTA_DATA(rta);
+			RTA_OK(vf_attr, rem);
+			vf_attr = RTA_NEXT(vf_attr, rem)) {
+			type = RTA_TYPE(vf_attr);
+			dst_vf = *(unsigned int *)RTA_DATA(vf_attr);
+			if (dst_vf != vfid)
+				break;
+			if (add_mirror_info(head, type, RTA_DATA(vf_attr)) < 0) {
+				del_mirror_list(head);
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
+static int vf_mirror_info_get(const char *name, int vfid,
+			      struct vf_mirror_node **head)
+{
+	struct iplink_req req = {
+		.n.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
+		.n.nlmsg_flags = NLM_F_REQUEST,
+		.n.nlmsg_type = RTM_GETLINK,
+		.i.ifi_family = preferred_family,
+	};
+	struct nlmsghdr *answer;
+
+	if (name) {
+		addattr_l(&req.n, sizeof(req),
+			  !check_ifname(name) ? IFLA_IFNAME : IFLA_ALT_IFNAME,
+			  name, strlen(name) + 1);
+	}
+	addattr32(&req.n, sizeof(req), IFLA_EXT_MASK, RTEXT_FILTER_VF);
+
+	if (rtnl_talk(&rth, &req.n, &answer) < 0)
+		return -2;
+
+	parse_vf_mirror(answer, vfid, head);
+
+	free(answer);
+	return 0;
+}
+
+static void get_dir(char ***argvp, int *dir_mask, int *argcp)
+{
+	int argc = *argcp;
+	char **argv = *argvp;
+
+	if (NEXT_ARG_OK()) {
+		NEXT_ARG();
+		if (matches(*argv, "dir") == 0) {
+			NEXT_ARG();
+			if (matches(*argv, "in") == 0)
+				*dir_mask = PORT_MIRRORING_INGRESS;
+			else if (matches(*argv, "out") == 0)
+				*dir_mask = PORT_MIRRORING_EGRESS;
+			else if (matches(*argv, "all") == 0)
+				*dir_mask = PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS;
+			else
+				invarg("Invalid \"direction\" value\n", *argv);
+		} else {
+			invarg("Invalid \"argument\" value\n", *argv);
+		}
+	}
+	*argcp = argc;
+	*argvp = argv;
+}
+
+static void dump_args(int type, void *data)
+{
+	if (type == IFLA_VF_MIRROR_VF) {
+		struct ifla_vf_mirror_vf *p = (struct ifla_vf_mirror_vf *)data;
+
+		printf("SENDING : VF dst_vf: %d src_vf : %d dir_mask : %d\n",
+				p->dst_vf, p->src_vf, p->dir_mask);
+	} else if (type == IFLA_VF_MIRROR_PF) {
+		struct ifla_vf_mirror_pf *p = (struct ifla_vf_mirror_pf *)data;
+
+		printf("SENDING : PF dst_vf: %d dir_mask : %d\n", p->dst_vf, p->dir_mask);
+	} else if (type == IFLA_VF_MIRROR_VLAN) {
+		struct ifla_vf_mirror_vlan *p = (struct ifla_vf_mirror_vlan *)data;
+
+		printf("SENDING : VLAN dst_vf: %d vlan : %d\n", p->dst_vf, p->vlan);
+	} else if (type == IFLA_VF_MIRROR_CLEAR) {
+		struct ifla_vf_mirror_clear *p = (struct ifla_vf_mirror_clear *)data;
+
+		printf("SENDING : CLEAR dst_vf: %d\n", p->dst_vf);
+	} else {
+		printf("SENDING : KIll the caller\n");
+	}
+}
+
+static int iplink_parse_vf_mirror_add_or_set(char ***argvp, int *argcp,
+					     const char *dev, int vf,
+					     struct iplink_req *req)
+{
+	int argc = *argcp;
+	char **argv = *argvp, *src_list;
+	int i = 0;
+	int dir_mask = PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS;
+	int *items = NULL, nb_items = 0, id;
+	struct ifla_vf_mirror_vf ivmv = {0};
+	struct ifla_vf_mirror_pf ivmp = {0};
+	struct ifla_vf_mirror_vlan ivml = {0};
+	struct vf_mirror_node *mi = NULL, *temp;
+
+	if (matches(*argv, "add") == 0)
+		vf_mirror_info_get(dev, vf, &mi);
+
+	NEXT_ARG();
+
+	if (matches(*argv, "vf") == 0) {
+		ivmv.dst_vf = vf;
+		NEXT_ARG();
+		src_list = *argv;
+
+		nb_items = get_int_args(src_list, &items);
+		if (nb_items <= 0)
+			invarg("Invalid vf ids", src_list);
+
+		get_dir(&argv, &dir_mask, &argc);
+
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.action == IFLA_VF_MIRROR_VF) {
+				i = nb_items;
+				ivmv.src_vf = temp->info.data.vf_to_vf.src_vf;
+				ivmv.dir_mask = temp->info.data.vf_to_vf.dir_mask;
+				while (i) {
+					id = items[i-1];
+					if (temp->info.data.vf_to_vf.src_vf == id) {
+						ivmv.dir_mask |= dir_mask;
+						items[i-1] = -1;
+						break;
+					}
+					--i;
+				}
+				dump_args(IFLA_VF_MIRROR_VF, &ivmv);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_VF, &ivmv,
+					  sizeof(ivmv));
+			} else {
+				invarg("Another type of \"rule\" is already set.\n", "vf");
+			}
+			temp = temp->next;
+		}
+
+		i = nb_items;
+		while (i) {
+			if (items[i-1] >= 0) {
+				ivmv.src_vf = items[i-1];
+				ivmv.dir_mask = dir_mask;
+				dump_args(IFLA_VF_MIRROR_VF, &ivmv);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_VF, &ivmv,
+					  sizeof(ivmv));
+			}
+			i--;
+		}
+	} else if (matches(*argv, "pf") == 0) {
+		get_dir(&argv, &dir_mask, &argc);
+		ivmp.dst_vf = vf;
+		ivmp.dir_mask = dir_mask;
+
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.action == IFLA_VF_MIRROR_PF &&
+			   temp->info.data.pf_to_vf.dst_vf == vf)
+				ivmp.dir_mask |= temp->info.data.pf_to_vf.dir_mask;
+			else if (temp->info.action != IFLA_VF_MIRROR_PF)
+				invarg("Another type of \"rule\" is already set.\n", "pf");
+			temp = temp->next;
+		}
+
+		dump_args(IFLA_VF_MIRROR_PF, &ivmp);
+		addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_PF, &ivmp, sizeof(ivmp));
+
+	} else if (matches(*argv, "vlan") == 0) {
+		ivml.dst_vf = vf;
+		NEXT_ARG();
+		src_list = *argv;
+
+		int *items, nb_items = 0, id;
+
+		nb_items = get_int_args(src_list, &items);
+		if (nb_items <= 0)
+			invarg("Invalid args", "vlan");
+
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.action == IFLA_VF_MIRROR_VLAN) {
+				i = nb_items;
+				ivml.vlan = temp->info.data.vlan_mirror.vlan;
+				while (i) {
+					id = items[i-1];
+					if (temp->info.data.vlan_mirror.vlan == id) {
+						items[i-1] = -1;
+						break;
+					}
+					--i;
+				}
+			} else {
+				invarg("Another type of \"rule\" is already set.\n", "vlan");
+			}
+
+			dump_args(IFLA_VF_MIRROR_VLAN, &ivml);
+			addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+			temp = temp->next;
+		}
+
+		i = nb_items;
+		while (i) {
+			if (items[i-1] >= 0) {
+				ivml.vlan = items[i-1];
+				dump_args(IFLA_VF_MIRROR_VLAN, &ivml);
+				addattr_l(&req->n, sizeof(*req),
+						IFLA_VF_MIRROR_VLAN, &ivml, sizeof(ivml));
+			}
+			i--;
+		}
+	} else
+		invarg("Invalid \"argument\" value\n", *argv);
+
+	if (items)
+		free(items);
+	del_mirror_list(&mi);
+	*argcp = argc;
+	*argvp = argv;
+	return 0;
+}
+
+static int iplink_parse_vf_mirror_del(char ***argvp, int *argcp,
+				      const char *dev, int vf,
+				      struct iplink_req *req)
+{
+	int argc = *argcp;
+	char **argv = *argvp, *src_list;
+	int i = 0;
+	int dir_mask = PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS;
+	int attr_count = 0, curr_count = 0;
+	int *items = NULL, nb_items = 0, id;
+	struct vf_mirror_node *mi = NULL, *temp;
+
+	vf_mirror_info_get(dev, vf, &mi);
+
+	NEXT_ARG();
+
+	if (mi == NULL)
+		invarg("Mirroring is not set.\n", "del");
+
+
+	if (matches(*argv, "vf") == 0) {
+		struct ifla_vf_mirror_vf ivmv = {0};
+
+		ivmv.dst_vf = vf;
+		NEXT_ARG();
+		src_list = *argv;
+		nb_items = get_int_args(src_list, &items);
+		if (nb_items <= 0)
+			invarg("vfid not present", "vf");
+
+		get_dir(&argv, &dir_mask, &argc);
+
+		temp = mi;
+		while (temp != NULL) {
+			i = nb_items;
+			if (temp->info.action == IFLA_VF_MIRROR_VF) {
+				while (i) {
+					id = items[i-1];
+					if (temp->info.data.vf_to_vf.src_vf == id) {
+						temp->info.data.vf_to_vf.dir_mask &= (~dir_mask);
+						items[i-1] = -1;
+						break;
+					}
+					--i;
+				}
+				curr_count++;
+			} else {
+				invarg("Another type of mirroring \"rule\" is set.\n", "vf");
+			}
+			temp = temp->next;
+		}
+
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.data.vf_to_vf.dir_mask > 0) {
+				ivmv.src_vf = temp->info.data.vf_to_vf.src_vf;
+				ivmv.dir_mask = temp->info.data.vf_to_vf.dir_mask;
+				attr_count++;
+				dump_args(IFLA_VF_MIRROR_VF, &ivmv);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_VF,
+					  &ivmv, sizeof(ivmv));
+			}
+			temp = temp->next;
+		}
+
+		if (attr_count == 0) {
+			if (curr_count == 0) {
+				invarg("Mirroring rule is not set for these vf\'s", "vf");
+			} else {
+				struct ifla_vf_mirror_clear ivmc = {.dst_vf = vf};
+
+				dump_args(IFLA_VF_MIRROR_CLEAR, &ivmc);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_CLEAR,
+					  &ivmc, sizeof(ivmc));
+			}
+		}
+	} else if (matches(*argv, "pf") == 0) {
+		struct ifla_vf_mirror_pf ivmp = {0};
+
+		get_dir(&argv, &dir_mask, &argc);
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.action == IFLA_VF_MIRROR_PF) {
+				if (temp->info.data.pf_to_vf.dst_vf == vf) {
+					ivmp.dst_vf = vf;
+					temp->info.data.pf_to_vf.dir_mask &= (~dir_mask);
+					ivmp.dir_mask = temp->info.data.pf_to_vf.dir_mask;
+					if (ivmp.dir_mask) {
+						dump_args(IFLA_VF_MIRROR_PF, &ivmp);
+						addattr_l(&req->n,
+							  sizeof(*req),
+							  IFLA_VF_MIRROR_PF,
+							  &ivmp, sizeof(ivmp));
+					} else {
+						struct ifla_vf_mirror_clear ivmc = {.dst_vf = vf};
+
+						dump_args(IFLA_VF_MIRROR_CLEAR, &ivmc);
+						addattr_l(&req->n,
+							  sizeof(*req),
+							  IFLA_VF_MIRROR_CLEAR,
+							  &ivmc, sizeof(ivmc));
+					}
+				} else {
+					invarg("Mirroring rule is not set for these vf\'s", "pf");
+				}
+			} else {
+				invarg("Another type of mirroring \"rule\" is set.\n", "pf");
+			}
+			temp = temp->next;
+		}
+	} else if (matches(*argv, "vlan") == 0) {
+		struct ifla_vf_mirror_vlan ivml = {0};
+
+		ivml.dst_vf = vf;
+		NEXT_ARG();
+		src_list = *argv;
+		nb_items = get_int_args(src_list, &items);
+		if (nb_items <= 0)
+			invarg("No vlan tag present", "vlan");
+
+		temp = mi;
+		while (temp != NULL) {
+			i = nb_items;
+			if (temp->info.action == IFLA_VF_MIRROR_VLAN) {
+				while (i) {
+					id = items[i-1];
+					if (temp->info.data.vlan_mirror.vlan == id) {
+						items[i-1] = -1;
+						temp->info.data.vlan_mirror.vlan = 0;
+						break;
+					}
+					--i;
+				}
+				curr_count++;
+			} else
+				invarg("Another type of \"rule\" is set.\n", "vlan");
+			temp = temp->next;
+		}
+
+		temp = mi;
+		while (temp != NULL) {
+			if (temp->info.data.vlan_mirror.vlan > 0) {
+				ivml.vlan = temp->info.data.vlan_mirror.vlan;
+				attr_count++;
+				dump_args(IFLA_VF_MIRROR_VLAN, &ivml);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_VLAN, &ivml,
+					  sizeof(ivml));
+			}
+			temp = temp->next;
+		}
+
+		if (!attr_count) {
+			if (curr_count) {
+				struct ifla_vf_mirror_clear ivmc = {.dst_vf = vf};
+
+				dump_args(IFLA_VF_MIRROR_CLEAR, &ivmc);
+				addattr_l(&req->n, sizeof(*req),
+					  IFLA_VF_MIRROR_CLEAR, &ivmc,
+					  sizeof(ivmc));
+			} else {
+				invarg("Mirroring rule is not set for these vlan\'s", "vlan");
+			}
+		}
+	} else {
+		invarg("Invalid \"argument\" value\n", *argv);
+	}
+
+	if (items)
+		free(items);
+	del_mirror_list(&mi);
+	*argcp = argc;
+	*argvp = argv;
+	return 0;
+
+}
+
+static int iplink_parse_vf_mirror(int vf, int *argcp, char ***argvp,
+				  struct iplink_req *req, const char *dev)
+{
+	int argc = *argcp;
+	char **argv = *argvp;
+	int err = 0;
+
+	if (matches(*argv, "add") == 0) {
+		err = iplink_parse_vf_mirror_add_or_set(&argv, &argc,
+							dev, vf, req);
+	} else if (matches(*argv, "del") == 0) {
+		err = iplink_parse_vf_mirror_del(&argv, &argc, dev, vf, req);
+	} else if (matches(*argv, "set") == 0) {
+		struct ifla_vf_mirror_clear ivmc = {0};
+
+		ivmc.dst_vf = vf;
+		dump_args(IFLA_VF_MIRROR_CLEAR, &ivmc);
+		addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_CLEAR, &ivmc, sizeof(ivmc));
+		err = iplink_parse_vf_mirror_add_or_set(&argv, &argc, dev, vf, req);
+	} else if (matches(*argv, "clear") == 0) {
+		struct ifla_vf_mirror_clear ivmc = {0};
+
+		ivmc.dst_vf = vf;
+		dump_args(IFLA_VF_MIRROR_CLEAR, &ivmc);
+		addattr_l(&req->n, sizeof(*req), IFLA_VF_MIRROR_CLEAR, &ivmc, sizeof(ivmc));
+	}
+
+	*argcp = argc;
+	*argvp = argv;
+	return err;
+}
+
 static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 			   struct iplink_req *req, const char *dev)
 {
@@ -352,6 +877,7 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 	int len, argc = *argcp;
 	char **argv = *argvp;
 	struct rtattr *vfinfo;
+	int ret = 0;
 
 	tivt.min_tx_rate = -1;
 	tivt.max_tx_rate = -1;
@@ -379,7 +905,17 @@ static int iplink_parse_vf(int vf, int *argcp, char ***argvp,
 
 	while (NEXT_ARG_OK()) {
 		NEXT_ARG();
-		if (matches(*argv, "mac") == 0) {
+		if (matches(*argv, "mirror") == 0) {
+			struct rtattr *vf_mirror;
+
+			vf_mirror = addattr_nest(&req->n, sizeof(*req),
+					      IFLA_VF_MIRROR);
+			NEXT_ARG();
+			ret = iplink_parse_vf_mirror(vf, &argc, &argv, req, dev);
+			if (ret < 0)
+				return ret;
+			addattr_nest_end(&req->n, vf_mirror);
+		} else if (matches(*argv, "mac") == 0) {
 			struct ifla_vf_mac ivm = { 0 };
 			int halen = nl_get_ll_addr_len(dev);
 
@@ -760,7 +1296,7 @@ int iplink_parse(int argc, char **argv, struct iplink_req *req, char **type)
 
 			len = iplink_parse_vf(vf, &argc, &argv, req, dev);
 			if (len < 0)
-				return -1;
+				return len;
 			addattr_nest_end(&req->n, vflist);
 
 			if (name == dev)
@@ -1059,6 +1595,7 @@ static int iplink_modify(int cmd, unsigned int flags, int argc, char **argv)
 		.i.ifi_family = preferred_family,
 	};
 	int ret;
+
 
 	ret = iplink_parse(argc, argv, &req, &type);
 	if (ret < 0)
@@ -1760,7 +2297,6 @@ int do_iplink(int argc, char **argv)
 			return do_set(argc-1, argv+1);
 #endif
 	}
-
 	if (matches(*argv, "show") == 0 ||
 	    matches(*argv, "lst") == 0 ||
 	    matches(*argv, "list") == 0)

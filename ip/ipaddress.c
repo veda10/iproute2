@@ -36,6 +36,8 @@
 #include "ip_common.h"
 #include "color.h"
 
+#define BIDIR_BITMASK (PORT_MIRRORING_INGRESS | PORT_MIRRORING_EGRESS)
+
 enum {
 	IPADD_LIST,
 	IPADD_FLUSH,
@@ -350,6 +352,58 @@ static void print_af_spec(FILE *fp, struct rtattr *af_spec_attr)
 
 static void print_vf_stats64(FILE *fp, struct rtattr *vfstats);
 
+static void print_vf_mirror_info(struct rtattr *vf_attr)
+{
+	char dir[][10] = {"in", "out", "in|out"};
+	int type;
+	struct ifla_vf_mirror_pf *pf_mirror = NULL;
+	struct ifla_vf_mirror_vf *vf_mirror = NULL;
+	struct ifla_vf_mirror_vlan *vlan_mirror = NULL;
+	int nb_items = 0;
+	struct rtattr *i;
+	int rem = RTA_PAYLOAD(vf_attr);
+
+	SPRINT_BUF(b2);
+
+	print_string(PRINT_ANY, "mirroring", ", mirroring", "");
+	for (i = RTA_DATA(vf_attr);
+		RTA_OK(i, rem); i = RTA_NEXT(i, rem)) {
+		type = RTA_TYPE(i);
+		switch (type) {
+		case IFLA_VF_MIRROR_PF:
+			pf_mirror = RTA_DATA(i);
+			if (pf_mirror->dir_mask > 0 &&
+			    pf_mirror->dir_mask <= BIDIR_BITMASK) {
+				print_string(PRINT_ANY, "pf", " pf<%s>",
+					     dir[pf_mirror->dir_mask - 1]);
+				nb_items++;
+			}
+			break;
+		case IFLA_VF_MIRROR_VF:
+			vf_mirror = RTA_DATA(i);
+			if (vf_mirror->dir_mask > 0 &&
+			    vf_mirror->dir_mask <= BIDIR_BITMASK) {
+				sprintf(b2, " vf<%s,%d>",
+					dir[vf_mirror->dir_mask - 1],
+					vf_mirror->src_vf);
+				print_string(PRINT_ANY, "vf", "%s", b2);
+				nb_items++;
+			}
+			break;
+		case IFLA_VF_MIRROR_VLAN:
+			vlan_mirror = RTA_DATA(i);
+			print_int(PRINT_ANY, "vf", " vlan<%d>",
+				  vlan_mirror->vlan);
+			nb_items++;
+			break;
+		default:
+			break;
+		}
+	}
+	if (!nb_items)
+		print_string(PRINT_ANY, "off", " off", "");
+}
+
 static void print_vfinfo(FILE *fp, struct ifinfomsg *ifi, struct rtattr *vfinfo)
 {
 	struct ifla_vf_mac *vf_mac;
@@ -543,6 +597,8 @@ static void print_vfinfo(FILE *fp, struct ifinfomsg *ifi, struct rtattr *vfinfo)
 				   : ", query_rss off",
 				   rss_query->setting);
 	}
+	if (vf[IFLA_VF_MIRROR])
+		print_vf_mirror_info(vf[IFLA_VF_MIRROR]);
 
 	if (vf[IFLA_VF_STATS] && show_stats)
 		print_vf_stats64(fp, vf[IFLA_VF_STATS]);
