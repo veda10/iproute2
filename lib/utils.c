@@ -1700,45 +1700,43 @@ int get_num_items(char *str, char sep, char replace)
 {
 	int nb_items = 0, len = 0;
 	char *temp = str;
-	while (*temp != '\0')
-	{
-		if (*temp == sep)
-		{
+
+	while (*temp != '\0') {
+		if (*temp == sep) {
 			if (!len)
 				return -1;
 			len = 0;
 			nb_items++;
 			*temp = replace;
-		}
-		else if (isdigit(*temp))
+		} else if (isdigit(*temp)) {
 			len++;
-		else
+		} else {
 			return -1;
+		}
 		temp++;
 	}
 	nb_items += (temp - str) ? 1 : 0;
 	return nb_items;
-
 }
 
-int get_int_args(char *str, int **items) {
+int get_int_args(char *str, int **items)
+{
 	char *next = str;
 	int count = 0;
-	int nb_items = get_num_items (str, ',',' ');
+	int nb_items = get_num_items(str, ',', ' ');
 
 	if (nb_items <= 0)
 		return -1;
 
-	*items = calloc(nb_items, sizeof (int));
+	*items = calloc(nb_items, sizeof(int));
 
 	if (*items == NULL)
 		return -1;
 
-	while (*next != '\0')
-	{
-		(*items)[count] = strtol(str,&next,0);
+	while (*next != '\0') {
+		(*items)[count] = strtol(str, &next, 0);
 		str = next;
-		count ++;
+		count++;
 	}
 	return count;
 }

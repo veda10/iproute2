@@ -75,9 +75,8 @@ struct rtnl_link_stats {
  *
  * @rx_dropped: Number of packets received but not processed,
  *   e.g. due to lack of resources or unsupported protocol.
- *   For hardware interfaces this counter may include packets discarded
- *   due to L2 address filtering but should not include packets dropped
- *   by the device due to buffer exhaustion which are counted separately in
+ *   For hardware interfaces this counter should not include packets
+ *   dropped by the device which are counted separately in
  *   @rx_missed_errors (since procfs folds those two counters together).
  *
  * @tx_dropped: Number of packets dropped on their way to transmission,
@@ -357,10 +356,8 @@ enum {
 };
 
 /* backwards compatibility for userspace */
-#ifndef __KERNEL__
 #define IFLA_RTA(r)  ((struct rtattr*)(((char*)(r)) + NLMSG_ALIGN(sizeof(struct ifinfomsg))))
 #define IFLA_PAYLOAD(n) NLMSG_PAYLOAD(n,sizeof(struct ifinfomsg))
-#endif
 
 enum {
 	IFLA_INET_UNSPEC,
@@ -589,8 +586,6 @@ enum {
 	IFLA_MACVLAN_MACADDR,
 	IFLA_MACVLAN_MACADDR_DATA,
 	IFLA_MACVLAN_MACADDR_COUNT,
-	IFLA_MACVLAN_BC_QUEUE_LEN,
-	IFLA_MACVLAN_BC_QUEUE_LEN_USED,
 	__IFLA_MACVLAN_MAX,
 };
 
@@ -1029,18 +1024,18 @@ struct ifla_vf_mirror_vlan {
 };
 
 struct ifla_vf_mirror_clear {
-        __u32 dst_vf;
+	__u32 dst_vf;
 };
 
 struct ifla_vf_mirror_info {
-        enum mirror_type action;
-        __u32 ele_index;
-        union {
+	enum mirror_type action;
+	__u32 ele_index;
+	union {
 		__u32 dst_vf;
-                struct ifla_vf_mirror_vf vf_to_vf;
-                struct ifla_vf_mirror_pf pf_to_vf;
-                struct ifla_vf_mirror_vlan vlan_mirror;
-        };
+		struct ifla_vf_mirror_vf vf_to_vf;
+		struct ifla_vf_mirror_pf pf_to_vf;
+		struct ifla_vf_mirror_vlan vlan_mirror;
+	};
 };
 
 /* VF ports management section
